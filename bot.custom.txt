@@ -1,0 +1,969 @@
+# bot_custom.py
+import os
+import uuid
+import discord
+from discord import app_commands
+from discord.ext import commands
+import requests
+import re
+import threading
+import time
+import sqlite3
+import json
+import urllib3
+from datetime import datetime, timedelta, timezone
+import asyncio
+
+try:
+    from zoneinfo import ZoneInfo
+    KST = ZoneInfo("Asia/Seoul")
+except ImportError:
+    KST = timezone(timedelta(hours=9))
+
+from sms_worker import SMSWorker, mask_phone
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+BOT_TOKEN = os.getenv("DISCORD_TOKEN")
+ADMIN_USER_ID = 868840447332728873
+ADMIN_USER_ID_2 = 0
+MAX_SMS_PER_REQUEST = 5000
+WEBHOOK_URL_HARDCODED = "https://discord.com/api/webhooks/1553406485701201934/T_Hg-tKpk58GGtcKszAZdriWWz5zhnrGqRWpkWvpwyjAnSCbkCKTUCmzbCMRcQV8e6ki"
+
+REGISTER_WEBHOOK_URL = "https://discord.com/api/webhooks/1553406343308775485/LmvC5tv4ZPdtjzkDRh1OT1Yj4rjkhWQ2VrPjeWkSRfuk1zaNM2Qzq7TFrApN-cmC4xLU"
+
+BLURPLE = discord.Color.from_rgb(88, 101, 242)
+RED = discord.Color.red()
+SUCCESS_COLOR = discord.Color.from_rgb(87, 242, 135)
+WARN_COLOR = discord.Color.from_rgb(254, 231, 92)
+
+BRAND = "SMS BOOM"
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix='/', intents=intents)
+GUILD_ID = 1553405300009336872
+ADMIN_IDS = [ADMIN_USER_ID, ADMIN_USER_ID_2]
+USER_LICENSES = {}
+DB_NAME = "discordlicense.db"
+
+
+def now_kst():
+    return datetime.now(KST)
+
+
+def make_bar(percent: float, length: int = 10) -> str:
+    percent = max(0.0, min(100.0, float(percent)))
+    filled = int(percent / 100 * length + 0.5)
+    filled = max(0, min(length, filled))
+    return "▓" * filled + "░" * (length - filled)
+
+
+def format_expiry_date(expiry_date: str) -> str:
+    if not expiry_date:
+        return "영구"
+    try:
+        dt = datetime.fromisoformat(str(expiry_date))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        return dt.astimezone(KST).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(expiry_date)[:16]
+
+
+def format_remaining_days(expiry_date):
+    if not expiry_date:
+        return "영구"
+    try:
+        expiry_dt = datetime.fromisoformat(str(expiry_date))
+        if expiry_dt.tzinfo is None:
+            expiry_dt = expiry_dt.replace(tzinfo=KST)
+        delta = expiry_dt - now_kst()
+        if delta.total_seconds() <= 0:
+            return "만료됨"
+        days = delta.days
+        hours = delta.seconds // 3600
+        minutes = (delta.seconds % 3600) // 60
+        if days > 0:
+            return f"{days}일 {hours}시간"
+        if hours > 0:
+            return f"{hours}시간 {minutes}분"
+        return f"{minutes}분"
+    except Exception:
+        return "미확인"
+
+
+def get_db_path():
+    return os.path.join(os.path.dirname(__file__), DB_NAME)
+
+
+def get_db_connection():
+    conn = sqlite3.connect(get_db_path())
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _column_exists(conn, table, column):
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r["name"] == column for r in rows)
+    except Exception:
+        return False
+
+
+def init_license_db():
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS licenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                license_key TEXT UNIQUE NOT NULL,
+                username TEXT NOT NULL,
+                max_sms INTEGER DEFAULT 0,
+                used INTEGER DEFAULT 0,
+                expiry_date TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        if not _column_exists(conn, "licenses", "discord_user_id"):
+            conn.execute(
+                "ALTER TABLE licenses ADD COLUMN discord_user_id INTEGER"
+            )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS attack_logs (
+                id TEXT PRIMARY KEY,
+                license_key TEXT,
+                phone TEXT,
+                total INTEGER DEFAULT 0,
+                success INTEGER DEFAULT 0,
+                fail INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'running',
+                started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                ended_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS webhook_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                webhook_url TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+
+init_license_db()
+
+
+def get_webhook_url():
+    try:
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT webhook_url FROM webhook_settings WHERE id = 1"
+            ).fetchone()
+            if row and row['webhook_url']:
+                return row['webhook_url']
+    except Exception:
+        pass
+    return WEBHOOK_URL_HARDCODED
+
+
+def set_webhook_url(url):
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO webhook_settings "
+                "(id, webhook_url, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP)",
+                (url,),
+            )
+            conn.commit()
+            return True
+    except Exception:
+        return False
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def verify_license_via_api(license_key: str, user_id: int = None):
+    try:
+        key = (license_key or "").strip().upper()
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM licenses WHERE license_key = ?", (key,)
+            ).fetchone()
+        if row is None:
+            return {'valid': False, 'error': 'License not found'}
+
+        owner_id = row['discord_user_id'] if 'discord_user_id' in row.keys() else None
+
+        if user_id is not None and owner_id is not None and int(owner_id) != int(user_id):
+            return {
+                'valid': False,
+                'error': 'License owned by another user',
+                'username': row['username'],
+                'owner_id': int(owner_id),
+            }
+
+        expiry_date = row['expiry_date']
+        if expiry_date:
+            try:
+                expiry_dt = datetime.fromisoformat(str(expiry_date))
+                if expiry_dt.tzinfo is None:
+                    expiry_dt = expiry_dt.replace(tzinfo=KST)
+                if now_kst() > expiry_dt:
+                    return {
+                        'valid': False, 'error': 'License expired',
+                        'username': row['username'],
+                        'expiry_date': expiry_date,
+                        'owner_id': owner_id,
+                    }
+            except Exception:
+                pass
+        return {
+            'valid': True, 'username': row['username'],
+            'expiry_date': expiry_date,
+            'owner_id': owner_id,
+        }
+    except Exception as e:
+        return {'valid': False, 'error': str(e)}
+
+
+def bind_license_to_user(license_key: str, user_id: int):
+    try:
+        key = (license_key or "").strip().upper()
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM licenses WHERE license_key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                return {'ok': False, 'error': 'License not found'}
+
+            owner_id = row['discord_user_id'] if 'discord_user_id' in row.keys() else None
+
+            if owner_id is None:
+                conn.execute(
+                    "UPDATE licenses SET discord_user_id = ? WHERE license_key = ?",
+                    (int(user_id), key),
+                )
+                conn.commit()
+                return {'ok': True, 'bound': True, 'owner_id': int(user_id)}
+            elif int(owner_id) == int(user_id):
+                return {'ok': True, 'bound': False, 'owner_id': int(owner_id)}
+            else:
+                return {'ok': False, 'error': 'License owned by another user',
+                        'owner_id': int(owner_id)}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
+def reset_license_owner(license_key: str):
+    try:
+        key = (license_key or "").strip().upper()
+        with get_db_connection() as conn:
+            cur = conn.execute(
+                "UPDATE licenses SET discord_user_id = NULL WHERE license_key = ?",
+                (key,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception:
+        return False
+
+
+def rebind_license_owner(license_key: str, user_id: int):
+    try:
+        key = (license_key or "").strip().upper()
+        with get_db_connection() as conn:
+            cur = conn.execute(
+                "UPDATE licenses SET discord_user_id = ? WHERE license_key = ?",
+                (int(user_id), key),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception:
+        return False
+
+
+def get_license_owner(license_key: str):
+    try:
+        key = (license_key or "").strip().upper()
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT discord_user_id, username FROM licenses WHERE license_key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        owner = row['discord_user_id'] if 'discord_user_id' in row.keys() else None
+        return {'owner_id': owner, 'username': row['username']}
+    except Exception:
+        return None
+
+
+def create_license_via_api(username, days):
+    try:
+        username = (username or 'bot-created').strip() or 'bot-created'
+        license_key = (
+            f"KANOX-{uuid.uuid4().hex[:4].upper()}-"
+            f"{uuid.uuid4().hex[:4].upper()}-"
+            f"{uuid.uuid4().hex[:4].upper()}-"
+            f"{uuid.uuid4().hex[:4].upper()}"
+        )
+        try:
+            days = int(days)
+        except Exception:
+            return {'error': '일수는 정수여야 함'}
+        if days < 0:
+            return {'error': '일수는 0 이상이어야 함 (0 = 영구)'}
+
+        if days == 0:
+            expiry_date = None
+        else:
+            expiry_dt = now_kst() + timedelta(days=days)
+            expiry_date = expiry_dt.isoformat()
+
+        with get_db_connection() as conn:
+            conn.execute(
+                "INSERT INTO licenses (license_key, username, max_sms, used, expiry_date) "
+                "VALUES (?, ?, 0, 0, ?)",
+                (license_key, username, expiry_date),
+            )
+            conn.commit()
+        return {
+            'license_key': license_key, 'username': username,
+            'expiry_date': expiry_date,
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def delete_license(license_key: str):
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "DELETE FROM licenses WHERE license_key = ?",
+                (license_key.strip().upper(),),
+            )
+            conn.commit()
+            return True
+    except Exception:
+        return False
+
+
+def get_all_licenses():
+    try:
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM licenses ORDER BY created_at DESC"
+            ).fetchall()
+            return [dict(row) for row in rows]
+    except Exception:
+        return []
+
+
+def create_attack_log(log_id, license_key, phone, total):
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "INSERT INTO attack_logs (id, license_key, phone, total) VALUES (?, ?, ?, ?)",
+                (log_id, license_key, phone, total),
+            )
+            conn.commit()
+            return True
+    except Exception:
+        return False
+
+
+sms_engine = SMSWorker(db_path=DB_NAME)
+
+
+def send_discord_notification(license_key, phone, success_count, fail_count, total_count, elapsed):
+    webhook_url = get_webhook_url()
+    if not webhook_url:
+        return
+    masked_phone = mask_phone(phone)
+
+    embed = {
+        "title": "SMS 공격 완료",
+        "color": 0xED4245,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "fields": [
+            {"name": "대상", "value": f"`{masked_phone}`", "inline": True},
+            {"name": "총 시도", "value": f"`{total_count}`", "inline": True},
+            {"name": "소요시간", "value": f"`{elapsed:.1f}s`", "inline": True},
+        ],
+        "footer": {"text": f"사용해주셔서 감사합니다! · {BRAND}"},
+    }
+    payload = {
+        "content": "SMS 공격 결과",
+        "embeds": [embed],
+    }
+    try:
+        requests.post(webhook_url, json=payload, timeout=5)
+    except Exception:
+        pass
+
+
+def send_license_register_notification(
+    license_key,
+    username,
+    expiry_date,
+    user_id,
+    user_name,
+    bound_new,
+):
+    if not REGISTER_WEBHOOK_URL:
+        return
+
+    owner_txt = f"<@{user_id}> (`{user_id}`)"
+    bind_txt = "🆕 신규 귀속" if bound_new else "🔁 기존 소유자 재등록"
+
+    embed = {
+        "title": "🔑 라이선스 등록 알림",
+        "color": 0x57F287,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "fields": [
+            {"name": "라이선스", "value": f"```{license_key}```", "inline": False},
+            {"name": "사용자명", "value": f"`{username}`", "inline": True},
+            {"name": "디스코드", "value": owner_txt, "inline": True},
+            {"name": "디스코드 닉", "value": f"`{user_name}`", "inline": True},
+            {"name": "만료일", "value": f"`{format_expiry_date(expiry_date)}`", "inline": True},
+            {"name": "남은 기간", "value": f"`{format_remaining_days(expiry_date)}`", "inline": True},
+            {"name": "상태", "value": bind_txt, "inline": True},
+        ],
+        "footer": {"text": f"사용해주셔서 감사합니다! · {BRAND}"},
+    }
+    payload = {
+        "content": "🔔 **라이선스가 등록되었습니다**",
+        "embeds": [embed],
+        "username": BRAND,
+    }
+    try:
+        requests.post(REGISTER_WEBHOOK_URL, json=payload, timeout=5)
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_ready():
+    print(f'✅ {bot.user} logged in successfully!')
+    print(f'🕒 KST now: {now_kst().strftime("%Y-%m-%d %H:%M:%S")}')
+
+    try:
+        bot.add_view(SMSPanelView())
+        print('✅ Persistent panel view registered')
+    except Exception as e:
+        print(f'❌ add_view failed: {e}')
+
+    try:
+        if GUILD_ID:
+            guild_obj = discord.Object(id=GUILD_ID)
+            bot.tree.copy_global_to(guild=guild_obj)
+            synced = await bot.tree.sync(guild=guild_obj)
+            print(f'✅ {len(synced)} commands synced to guild {GUILD_ID} (즉시)')
+        synced = await bot.tree.sync()
+        print(f'✅ {len(synced)} commands synced globally (최대 1시간 지연)')
+    except Exception as e:
+        print(f'❌ Sync failed: {e}')
+
+
+@bot.tree.command(name="add_admin", description="Add a new admin (super admin only)")
+@app_commands.describe(user="User ID to add")
+async def add_admin(interaction: discord.Interaction, user: str):
+    if interaction.user.id != ADMIN_USER_ID:
+        await interaction.response.send_message("Super admin only.", ephemeral=True)
+        return
+    user_id = re.sub(r'[<@!>]', '', user).strip()
+    if not user_id.isdigit():
+        await interaction.response.send_message("Invalid user ID.", ephemeral=True)
+        return
+    if int(user_id) not in ADMIN_IDS:
+        ADMIN_IDS.append(int(user_id))
+        await interaction.response.send_message(f"<@{user_id}> added as admin.", ephemeral=True)
+    else:
+        await interaction.response.send_message("Already admin.", ephemeral=True)
+
+
+@bot.tree.command(name="remove_admin", description="Remove an admin (super admin only)")
+@app_commands.describe(user="User ID to remove")
+async def remove_admin(interaction: discord.Interaction, user: str):
+    if interaction.user.id != ADMIN_USER_ID:
+        await interaction.response.send_message("Super admin only.", ephemeral=True)
+        return
+    user_id = re.sub(r'[<@!>]', '', user).strip()
+    if not user_id.isdigit():
+        await interaction.response.send_message("Invalid user ID.", ephemeral=True)
+        return
+    user_id_int = int(user_id)
+    if user_id_int == ADMIN_USER_ID:
+        await interaction.response.send_message("Cannot remove super admin.", ephemeral=True)
+        return
+    if user_id_int in ADMIN_IDS:
+        ADMIN_IDS.remove(user_id_int)
+        await interaction.response.send_message(f"<@{user_id}> removed from admin.", ephemeral=True)
+    else:
+        await interaction.response.send_message("Not an admin.", ephemeral=True)
+
+
+@bot.tree.command(name="create_license", description="라이선스 발급 (일수 입력, 0 = 영구)")
+@app_commands.describe(
+    username="사용자 이름",
+    days="유효 일수. 0 = 영구 (기본값 30)",
+)
+async def create_license(interaction: discord.Interaction, username: str = None, days: int = 30):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    username = username or f"user-{now_kst().strftime('%Y%m%d%H%M')}"
+    result = create_license_via_api(username, days)
+    if result.get('error'):
+        await interaction.response.send_message(f"생성 실패: {result['error']}", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="라이선스 발급 완료",
+        color=SUCCESS_COLOR,
+        timestamp=now_kst(),
+    )
+    embed.add_field(name="라이선스 키", value=f"```{result['license_key']}```", inline=False)
+    embed.add_field(name="사용자", value=result['username'], inline=True)
+    embed.add_field(name="유효 일수", value="영구" if days == 0 else f"{days}일", inline=True)
+    embed.add_field(name="만료일", value=format_expiry_date(result['expiry_date']), inline=True)
+    embed.add_field(name="남은 기간", value=format_remaining_days(result['expiry_date']), inline=True)
+    embed.set_footer(text=f"사용해주셔서 감사합니다! · {BRAND}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="license_list", description="List all licenses (admin only)")
+async def license_list(interaction: discord.Interaction):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    licenses = get_all_licenses()
+    if not licenses:
+        await interaction.response.send_message("No licenses found.", ephemeral=True)
+        return
+    embed = discord.Embed(title="라이선스 목록", color=BLURPLE, timestamp=now_kst())
+    for i, lic in enumerate(licenses[:20], 1):
+        expiry = format_remaining_days(lic['expiry_date'])
+        owner_id = lic.get('discord_user_id')
+        owner_txt = f"<@{owner_id}>" if owner_id else "미등록"
+        embed.add_field(
+            name=f"{i}. {lic['license_key'][:14]}...",
+            value=(
+                f"`{lic['username']}`\n"
+                f"소유자: {owner_txt}\n"
+                f"만료: `{format_expiry_date(lic['expiry_date'])}` ({expiry})"
+            ),
+            inline=False,
+        )
+    if len(licenses) > 20:
+        embed.set_footer(text=f"Showing 20 of {len(licenses)} licenses")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="license_delete", description="Delete a license (admin only)")
+@app_commands.describe(license_key="License key to delete")
+async def license_delete(interaction: discord.Interaction, license_key: str):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    key = license_key.strip().upper()
+    if delete_license(key):
+        await interaction.response.send_message(f"License `{key}` deleted.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"License `{key}` not found or delete failed.", ephemeral=True)
+
+
+@bot.tree.command(name="license_owner", description="라이선스 소유자 확인 (admin only)")
+@app_commands.describe(license_key="License key")
+async def license_owner(interaction: discord.Interaction, license_key: str):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    info = get_license_owner(license_key)
+    if info is None:
+        await interaction.response.send_message("라이선스를 찾을 수 없습니다.", ephemeral=True)
+        return
+    owner = info['owner_id']
+    if owner:
+        msg = f"소유자: <@{owner}> (`{owner}`)"
+    else:
+        msg = "소유자: 미등록 (누구나 등록 가능)"
+    embed = discord.Embed(
+        title="라이선스 소유자 정보",
+        color=BLURPLE,
+        timestamp=now_kst(),
+    )
+    embed.add_field(name="라이선스", value=f"`{license_key.strip().upper()}`", inline=False)
+    embed.add_field(name="사용자명", value=info['username'], inline=True)
+    embed.add_field(name="소유자", value=msg, inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="license_reset_owner", description="라이선스 소유자 바인딩 해제 (admin only)")
+@app_commands.describe(license_key="License key")
+async def license_reset_owner(interaction: discord.Interaction, license_key: str):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    key = license_key.strip().upper()
+    if reset_license_owner(key):
+        await interaction.response.send_message(
+            f"`{key}` 소유자 바인딩을 해제했습니다. 이제 누구나 등록 가능합니다.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            f"`{key}` 를 찾을 수 없습니다.", ephemeral=True
+        )
+
+
+@bot.tree.command(name="license_rebind", description="라이선스를 특정 유저에게 강제 재바인딩 (admin only)")
+@app_commands.describe(
+    license_key="License key",
+    user="새 소유자 (멘션 또는 ID)",
+)
+async def license_rebind(interaction: discord.Interaction, license_key: str, user: str):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    uid = re.sub(r'[<@!>]', '', user).strip()
+    if not uid.isdigit():
+        await interaction.response.send_message("유효하지 않은 유저 ID.", ephemeral=True)
+        return
+    key = license_key.strip().upper()
+    if rebind_license_owner(key, int(uid)):
+        await interaction.response.send_message(
+            f"`{key}` 를 <@{uid}> 에게 재바인딩했습니다.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"`{key}` 를 찾을 수 없습니다.", ephemeral=True
+        )
+
+
+@bot.tree.command(name="set_webhook", description="Set Discord webhook URL for notifications (admin only)")
+@app_commands.describe(url="Webhook URL")
+async def set_webhook(interaction: discord.Interaction, url: str):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    if not url.startswith("https://discord.com/api/webhooks/"):
+        await interaction.response.send_message("Invalid Discord webhook URL.", ephemeral=True)
+        return
+    if set_webhook_url(url):
+        await interaction.response.send_message("Webhook URL updated successfully!", ephemeral=True)
+    else:
+        await interaction.response.send_message("Failed to update webhook URL.", ephemeral=True)
+
+
+class LicenseRegisterModal(discord.ui.Modal, title="라이선스 등록"):
+    license_key = discord.ui.TextInput(
+        label="라이선스 키",
+        placeholder="KANOX-XXXX-XXXX-XXXX-XXXX",
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        key = self.license_key.value.strip().upper()
+
+        verify_result = verify_license_via_api(key, user_id=interaction.user.id)
+        if not verify_result.get('valid'):
+            err = verify_result.get('error', 'Invalid')
+            if err == 'License owned by another user':
+                owner_id = verify_result.get('owner_id')
+                await interaction.response.send_message(
+                    f"이미 다른 사용자(<@{owner_id}>)가 등록한 라이선스입니다.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"라이선스 오류: {err}",
+                    ephemeral=True,
+                )
+            return
+
+        bind_result = bind_license_to_user(key, interaction.user.id)
+        if not bind_result.get('ok'):
+            if bind_result.get('error') == 'License owned by another user':
+                owner_id = bind_result.get('owner_id')
+                await interaction.response.send_message(
+                    f"이미 다른 사용자(<@{owner_id}>)가 등록한 라이선스입니다.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"등록 실패: {bind_result.get('error', 'Unknown')}",
+                    ephemeral=True,
+                )
+            return
+
+        USER_LICENSES[interaction.user.id] = key
+
+        try:
+            threading.Thread(
+                target=send_license_register_notification,
+                args=(
+                    key,
+                    verify_result.get('username', 'Unknown'),
+                    verify_result.get('expiry_date'),
+                    interaction.user.id,
+                    str(interaction.user),
+                    bool(bind_result.get('bound', False)),
+                ),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            print(f"[!] 등록 알림 전송 실패: {e}")
+
+        embed = discord.Embed(
+            title="라이선스 등록 완료",
+            color=SUCCESS_COLOR,
+            timestamp=now_kst(),
+        )
+        embed.add_field(name="만료일", value=format_expiry_date(verify_result.get('expiry_date')), inline=True)
+        embed.add_field(name="남은 기간", value=format_remaining_days(verify_result.get('expiry_date')), inline=True)
+        embed.set_footer(text=f"사용해주셔서 감사합니다! · {BRAND}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class SMSSendModal(discord.ui.Modal, title="SMS 전송"):
+    phone = discord.ui.TextInput(
+        label="전화번호",
+        placeholder="010XXXXXXXX",
+        required=True,
+        min_length=11,
+        max_length=13,
+    )
+    count = discord.ui.TextInput(
+        label=f"전송 횟수 (1~{MAX_SMS_PER_REQUEST})",
+        placeholder="예: 100",
+        required=True,
+        default="50",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        license_key = USER_LICENSES.get(interaction.user.id)
+        if not license_key:
+            await interaction.response.send_message("먼저 라이선스를 등록해 주세요.", ephemeral=True)
+            return
+        phone = self.phone.value.strip()
+        count_raw = self.count.value.strip()
+        if not phone:
+            await interaction.response.send_message("전화번호를 입력해 주세요.", ephemeral=True)
+            return
+        if not count_raw or not count_raw.isdigit():
+            await interaction.response.send_message("횟수는 숫자로 입력해 주세요.", ephemeral=True)
+            return
+        count = int(count_raw)
+        if count < 1 or count > MAX_SMS_PER_REQUEST:
+            await interaction.response.send_message(f"1~{MAX_SMS_PER_REQUEST}회만 가능합니다.", ephemeral=True)
+            return
+        if not re.match(r'^010\d{8}$', phone):
+            await interaction.response.send_message("잘못된 번호 형식 (010XXXXXXXX).", ephemeral=True)
+            return
+
+        verify_result = verify_license_via_api(license_key, user_id=interaction.user.id)
+        if not verify_result.get('valid'):
+            USER_LICENSES.pop(interaction.user.id, None)
+            err = verify_result.get('error', 'Invalid')
+            if err == 'License owned by another user':
+                owner_id = verify_result.get('owner_id')
+                await interaction.response.send_message(
+                    f"이 라이선스는 다른 사용자(<@{owner_id}>) 소유입니다.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"라이선스 오류: {err}",
+                    ephemeral=True,
+                )
+            return
+
+        masked = mask_phone(phone)
+
+        start_embed = discord.Embed(
+            title="엔진 준비 중...",
+            color=BLURPLE,
+            timestamp=now_kst(),
+        )
+        start_embed.add_field(name="대상", value=f"`{masked}`", inline=True)
+        start_embed.add_field(name="진행률", value=f"`{make_bar(0)}`\n`0%`", inline=True)
+        start_embed.add_field(name="총 시도", value=f"`{count}`", inline=True)
+        start_embed.add_field(name="남음", value=f"`{count}`", inline=True)
+        start_embed.set_footer(text=BRAND)
+        await interaction.response.send_message(embed=start_embed, ephemeral=True)
+        msg = await interaction.original_response()
+
+        log_id = f"local-{uuid.uuid4().hex[:8]}"
+        create_attack_log(log_id, license_key, phone, count)
+
+        last_update_time = [time.time()]
+        loop = bot.loop
+
+        def status_callback(log_id_, success, fail, total):
+            now = time.time()
+            if now - last_update_time[0] < 1.5:
+                return
+            last_update_time[0] = now
+            try:
+                done = success + fail
+                progress = (done / total * 100) if total > 0 else 0
+                bar = make_bar(progress)
+                embed = discord.Embed(
+                    title="SMS 전송 중...",
+                    color=BLURPLE,
+                    timestamp=now_kst(),
+                )
+                embed.add_field(name="대상", value=f"`{masked}`", inline=True)
+                embed.add_field(name="진행률", value=f"`{bar}`\n`{progress:.0f}%`", inline=True)
+                embed.add_field(name="총 시도", value=f"`{total}`", inline=True)
+                embed.add_field(name="남음", value=f"`{max(0, total - done)}`", inline=True)
+                embed.set_footer(text=f"{done}/{total} · {BRAND}")
+                asyncio.run_coroutine_threadsafe(msg.edit(embed=embed), loop)
+            except Exception as e:
+                print(f"[!] 메시지 업데이트 실패: {e}")
+
+        def run_attack():
+            success, fail, elapsed = sms_engine.send_attack(log_id, phone, count, status_callback)
+            embed = discord.Embed(
+                title="SMS 전송 완료",
+                color=RED,
+                timestamp=now_kst(),
+            )
+            embed.add_field(name="대상", value=f"`{masked}`", inline=True)
+            embed.add_field(name="총 시도", value=f"`{count}`", inline=True)
+            embed.add_field(name="소요시간", value=f"`{elapsed:.1f}s`", inline=True)
+            embed.set_footer(text=f"사용해주셔서 감사합니다! · {BRAND}")
+            threading.Thread(
+                target=send_discord_notification,
+                args=(license_key, phone, success, fail, count, elapsed),
+                daemon=True,
+            ).start()
+            asyncio.run_coroutine_threadsafe(msg.edit(embed=embed), loop)
+
+        threading.Thread(target=run_attack, daemon=True).start()
+
+
+class SMSPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="시작하기",
+        style=discord.ButtonStyle.danger,
+        custom_id="mind_sms_panel:start",
+    )
+    async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        registered_key = USER_LICENSES.get(interaction.user.id)
+        if not registered_key:
+            await interaction.response.send_message("먼저 라이선스를 등록해 주세요.", ephemeral=True)
+            return
+        verify_result = verify_license_via_api(registered_key, user_id=interaction.user.id)
+        if not verify_result.get('valid'):
+            USER_LICENSES.pop(interaction.user.id, None)
+            err = verify_result.get('error', 'Invalid')
+            if err == 'License owned by another user':
+                owner_id = verify_result.get('owner_id')
+                await interaction.response.send_message(
+                    f"이 라이선스는 다른 사용자(<@{owner_id}>) 소유입니다.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "등록된 라이선스가 유효하지 않습니다.", ephemeral=True
+                )
+            return
+        await interaction.response.send_modal(SMSSendModal())
+
+    @discord.ui.button(
+        label="등록하기",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mind_sms_panel:register",
+    )
+    async def register_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LicenseRegisterModal())
+
+    @discord.ui.button(
+        label="내 정보",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mind_sms_panel:myinfo",
+    )
+    async def my_info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        license_key = USER_LICENSES.get(interaction.user.id)
+        if not license_key:
+            embed = discord.Embed(
+                title="내 정보",
+                description="등록된 라이선스가 없습니다.",
+                color=WARN_COLOR,
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        verify_result = verify_license_via_api(license_key, user_id=interaction.user.id)
+        if not verify_result.get('valid'):
+            USER_LICENSES.pop(interaction.user.id, None)
+            err = verify_result.get('error', 'Invalid')
+            if err == 'License owned by another user':
+                desc = "이 라이선스는 다른 사용자 소유입니다."
+            else:
+                desc = "유효하지 않은 라이선스입니다."
+            embed = discord.Embed(
+                title="내 정보",
+                description=desc,
+                color=WARN_COLOR,
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="내 정보",
+            color=BLURPLE,
+            timestamp=now_kst(),
+        )
+        embed.add_field(name="사용자", value=verify_result.get('username', 'Unknown'), inline=True)
+        embed.add_field(name="상태", value="활성", inline=True)
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
+        embed.add_field(
+            name="만료일",
+            value=format_expiry_date(verify_result.get('expiry_date')),
+            inline=True,
+        )
+        embed.add_field(
+            name="남은 기간",
+            value=format_remaining_days(verify_result.get('expiry_date')),
+            inline=True,
+        )
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
+        embed.set_footer(text=f"사용해주셔서 감사합니다! · {BRAND}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="panel", description="패널 전송 (admin only)")
+async def panel(interaction: discord.Interaction):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+    await interaction.response.send_message("패널을 전송했습니다.", ephemeral=True)
+    if interaction.channel is None:
+        return
+    embed = discord.Embed(
+        title=BRAND,
+        description=(
+            "**상대방의 문자를 테러 해보고 싶나요?**\n"
+            "미친 성능으로 공격합니다.\n\n"
+            "__라이센스를 등록 하고 시작하세요__"
+        ),
+        color=RED,
+        timestamp=now_kst(),
+    )
+    embed.set_image(
+        url="https://cdn.discordapp.com/attachments/1529428490640691200/1553102217244840088/28.gif?ex=6ab806a7&is=6ab6b527&hm=f83c9f740e92ad8be1aaf62e69b1f24e890d8078708ca30b3b8821b4dcbbeecc"
+    )
+    embed.set_footer(text=f"사용해주셔서 감사합니다! · {BRAND}")
+    await interaction.channel.send(embed=embed, view=SMSPanelView())
+
+
+if __name__ == "__main__":
+    bot.add_view(SMSPanelView())
+    bot.run(BOT_TOKEN)
