@@ -1,4 +1,21 @@
-# bot_custom.py
+import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+# Render 포트 감지용 가짜 웹 서버
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    server.serve_forever()
+
+# 웹 서버를 별도 쓰레드로 실행
+threading.Thread(target=run_web_server, daemon=True).start()# bot_custom.py
 import os
 import uuid
 import discord
